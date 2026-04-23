@@ -1,0 +1,215 @@
+metadata:
+  name: video-bgmusic
+  version: "1.0.0"
+  description: "Mix a music bed under an existing video with automatic ducking — the music drops when narration is present and comes back when the voice pauses. Pure ffmpeg sidechain compression."
+  author: Agentino
+  tags:
+    - video
+    - audio
+    - music
+    - ducking
+    - ffmpeg
+    - marketplace
+  license: MIT
+  homepage: https://github.com/agentino/agentino
+
+spec:
+  input:
+    - name: video_path
+      type: string
+      description: "Absolute path to the source video (assumed to already have a voice / narration track on stream 0:a)."
+      required: true
+    - name: music_path
+      type: string
+      description: "Absolute path to the music file (WAV / MP3 / AAC / FLAC / OGG)."
+      required: true
+    - name: output_path
+      type: string
+      description: "Destination MP4. Defaults to '<video>.scored.<ext>' next to the source."
+      required: false
+      default: ""
+    - name: music_volume_db
+      type: number
+      description: "Baseline music volume when the voice is quiet, in dBFS. -18 is a comfortable bed under speech; -12 is prominent; -24 is barely-there."
+      required: false
+      default: -18.0
+    - name: duck_depth_db
+      type: number
+      description: "How many extra dB the music should drop when the voice is active. 12 is the classic broadcast ducking depth; 6 is light; 18+ is aggressive."
+      required: false
+      default: 12.0
+    - name: duck_attack_ms
+      type: integer
+      description: "How fast the music ducks when the voice starts speaking (ms). 200 ms feels natural; 50 is punchy; 500 is sluggish."
+      required: false
+      default: 200
+    - name: duck_release_ms
+      type: integer
+      description: "How fast the music returns when the voice pauses (ms). 500 ms avoids pumping on short pauses; 1000+ is smooth; <300 sounds jittery."
+      required: false
+      default: 500
+    - name: duck_threshold
+      type: number
+      description: "Sidechain threshold — voice amplitude above which ducking kicks in. 0.03 catches conversational speech; 0.01 catches whispers; 0.1 only ducks on loud lines."
+      required: false
+      default: 0.03
+    - name: loop_music
+      type: boolean
+      description: "If the music is shorter than the video, loop it to cover the full duration."
+      required: false
+      default: true
+    - name: fade_in_s
+      type: number
+      description: "Fade-in length for the music at the start of the video, seconds."
+      required: false
+      default: 1.0
+    - name: fade_out_s
+      type: number
+      description: "Fade-out length for the music at the end of the video, seconds."
+      required: false
+      default: 2.0
+
+  output:
+    type: object
+    description: "Score summary: output_path, input_duration_s, output_duration_s, music_duration_s, music_looped, music_volume_db, duck_depth_db."
+
+  security:
+    sandbox_level: none
+    network_access: false
+    file_access: read-write
+
+  timeout_s: 900.0
+
+  executor:
+    type: python
+    code: |
+      import shutil
+      import subprocess
+      import tempfile
+      from pathlib import Path
+
+      def _which(cmd):
+          p = shutil.which(cmd)
+          if not p:
+              raise RuntimeError(f"'{cmd}' not found on PATH. Install ffmpeg (brew/apt).")
+          return p
+
+      def _probe_duration(path):
+          ffprobe = _which("ffprobe")
+          r = subprocess.run(
+              [ffprobe, "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+              check=True, capture_output=True, text=True, timeout=30,
+          )
+          return float(r.stdout.strip())
+
+      def _db_to_linear(db):
+          return 10 ** (float(db) / 20.0)
+
+      video_path = Path(str(input.get("video_path") or "")).expanduser().resolve()
+      if not video_path.is_file():
+          raise FileNotFoundError(f"video_path not found: {video_path}")
+
+      music_path = Path(str(input.get("music_path") or "")).expanduser().resolve()
+      if not music_path.is_file():
+          raise FileNotFoundError(f"music_path not found: {music_path}")
+
+      requested_out = (input.get("output_path") or "").strip()
+      if requested_out:
+          output_path = Path(requested_out).expanduser().resolve()
+          output_path.parent.mkdir(parents=True, exist_ok=True)
+      else:
+          stem = video_path.stem
+          ext = video_path.suffix or ".mp4"
+          output_path = video_path.with_name(f"{stem}.scored{ext}")
+
+      music_vol_db = float(input.get("music_volume_db") or -18.0)
+      duck_depth_db = float(input.get("duck_depth_db") or 12.0)
+      if duck_depth_db < 0:
+          raise ValueError("duck_depth_db must be non-negative (it's the amount the music drops).")
+      duck_attack_ms = max(1, int(input.get("duck_attack_ms") or 200))
+      duck_release_ms = max(1, int(input.get("duck_release_ms") or 500))
+      duck_threshold = max(0.0001, float(input.get("duck_threshold") or 0.03))
+      loop_music = bool(input.get("loop_music", True))
+      fade_in_s = max(0.0, float(input.get("fade_in_s") or 0.0))
+      fade_out_s = max(0.0, float(input.get("fade_out_s") or 0.0))
+
+      video_duration = _probe_duration(video_path)
+      music_duration = _probe_duration(music_path)
+      music_looped = loop_music and music_duration < video_duration - 0.1
+
+      music_vol_linear = _db_to_linear(music_vol_db)
+      # Sidechain compressor ratio derived from desired duck depth.
+      # A ratio of R applied above threshold reduces ~20*log10(R) dB of dynamic range
+      # in the compressed stream; picking R = 10^(duck_depth_db/20) gives the target
+      # reduction when the voice sidechain exceeds threshold.
+      duck_ratio = 10 ** (duck_depth_db / 20.0)
+
+      # Build the filter graph.
+      # Stream layout:
+      #   [0:v]  original video
+      #   [0:a]  original voice track
+      #   [1:a]  music
+      #
+      # Music leg: loop (optional) → volume → fade-in/out → label [bed]
+      # Final mix: sidechaincompress(bed, voice) → [ducked]
+      #            amix(ducked, voice) → [mixed]
+      #
+      # `aloop=loop=-1:size=<samples>` expects size in samples, not seconds;
+      # using a large sample buffer (2e9 ≈ 12 h at 48 kHz) handles every realistic
+      # music file without exhausting memory, since aloop streams lazily.
+
+      music_chain_parts = ["[1:a]"]
+      if music_looped:
+          music_chain_parts.append("aloop=loop=-1:size=2e9")
+      music_chain_parts.append(f"volume={music_vol_linear:.6f}")
+      if fade_in_s > 0:
+          music_chain_parts.append(f"afade=t=in:st=0:d={fade_in_s}")
+      if fade_out_s > 0:
+          fade_start = max(0.0, video_duration - fade_out_s)
+          music_chain_parts.append(f"afade=t=out:st={fade_start}:d={fade_out_s}")
+      music_chain_parts.append(f"atrim=0:{video_duration}")
+      music_chain_parts.append("asetpts=PTS-STARTPTS")
+      music_chain = ",".join(music_chain_parts[1:])
+      # Final assembly for [1:a]:
+      music_leg = f"[1:a]{music_chain}[bed]"
+
+      voice_split = "[0:a]asplit=2[vox_main][vox_sc]"
+      duck = (
+          f"[bed][vox_sc]sidechaincompress="
+          f"threshold={duck_threshold}:ratio={duck_ratio:.4f}:"
+          f"attack={duck_attack_ms}:release={duck_release_ms}:makeup=1[ducked]"
+      )
+      mix = "[vox_main][ducked]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+
+      filter_complex = ";".join([music_leg, voice_split, duck, mix])
+
+      ffmpeg = _which("ffmpeg")
+      cmd = [
+          ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+          "-i", str(video_path),
+          "-i", str(music_path),
+          "-filter_complex", filter_complex,
+          "-map", "0:v",
+          "-map", "[aout]",
+          "-c:v", "copy",
+          "-c:a", "aac", "-b:a", "192k",
+          "-shortest",
+          "-movflags", "+faststart",
+          str(output_path),
+      ]
+      subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=1200)
+
+      out_duration = _probe_duration(output_path)
+
+      result = {
+          "output_path": str(output_path),
+          "input_duration_s": round(video_duration, 3),
+          "output_duration_s": round(out_duration, 3),
+          "music_duration_s": round(music_duration, 3),
+          "music_looped": music_looped,
+          "music_volume_db": music_vol_db,
+          "duck_depth_db": duck_depth_db,
+          "duck_attack_ms": duck_attack_ms,
+          "duck_release_ms": duck_release_ms,
+      }
