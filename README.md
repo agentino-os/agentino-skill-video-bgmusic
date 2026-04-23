@@ -9,7 +9,7 @@ An Agentino skill that takes a video already carrying a voice track and a music 
 - the music loops if it's shorter than the video,
 - the video track is stream-copied (no re-encode) so quality is preserved.
 
-Designed to chain after [`video-voiceover`](https://github.com/dagoSte/agentino-skill-video-voiceover) + [`video-slideshow`](https://github.com/dagoSte/agentino-skill-video-slideshow) + [`video-captions-burn`](https://github.com/dagoSte/agentino-skill-video-captions-burn) — add a music bed to the captioned narrated MP4 in one pass.
+Designed to chain after [`video-voiceover`](https://github.com/agentino-os/agentino-skill-video-voiceover) + [`video-slideshow`](https://github.com/agentino-os/agentino-skill-video-slideshow) + [`video-captions-burn`](https://github.com/agentino-os/agentino-skill-video-captions-burn) — add a music bed to the captioned narrated MP4 in one pass.
 
 ## Install
 
@@ -19,7 +19,7 @@ Requires [Agentino](https://github.com/dagoSte/agentino) ≥ `1.2.0-rc.1` and `f
 brew install ffmpeg                                                    # macOS
 # sudo apt install ffmpeg                                              # Debian / Ubuntu
 
-agentino marketplace install dagoSte/agentino-skill-video-bgmusic
+agentino marketplace install agentino-os/agentino-skill-video-bgmusic
 agentino skill show video-bgmusic
 ```
 
